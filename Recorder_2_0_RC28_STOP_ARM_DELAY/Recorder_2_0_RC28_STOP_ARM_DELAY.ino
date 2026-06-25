@@ -145,6 +145,128 @@ volatile bool wasPressedGlobal = false;
 
 volatile bool transitionBusy = false;
 static bool waitForRelease=false;
+extern bool isRecording;
+static bool diagRawTouchActiveState=false;
+static bool diagStopTouchActiveState=false;
+
+static const char *diagCommandName(RecorderCommand cmd)
+{
+    switch (cmd)
+    {
+        case CMD_START: return "CMD_START";
+        case CMD_STOP: return "CMD_STOP";
+        default: return "CMD_NONE";
+    }
+}
+
+static void diagSetTransitionBusy(bool value, const char *reason, const char *source)
+{
+    if (transitionBusy != value)
+    {
+        Serial.printf(
+            "STATE transitionBusy=%d reason=%s source=%s ms=%lu\n",
+            value,
+            reason,
+            source,
+            millis());
+    }
+
+    transitionBusy = value;
+}
+
+static void diagSetWaitForRelease(bool value, const char *reason, const char *source)
+{
+    if (waitForRelease != value)
+    {
+        Serial.printf(
+            "STATE waitForRelease=%d reason=%s source=%s ms=%lu\n",
+            value,
+            reason,
+            source,
+            millis());
+    }
+
+    waitForRelease = value;
+}
+
+static void diagSetRawTouchActive(bool *state, bool value, const char *reason, const char *source)
+{
+    if (*state != value)
+    {
+        Serial.printf(
+            "STATE rawTouchActive=%d reason=%s source=%s ms=%lu\n",
+            value,
+            reason,
+            source,
+            millis());
+    }
+
+    *state = value;
+    diagRawTouchActiveState = value;
+}
+
+static void diagSetStopTouchActive(bool *state, bool value, const char *reason, const char *source)
+{
+    if (*state != value)
+    {
+        Serial.printf(
+            "STATE stopTouchActive=%d reason=%s source=%s ms=%lu\n",
+            value,
+            reason,
+            source,
+            millis());
+    }
+
+    *state = value;
+    diagStopTouchActiveState = value;
+}
+
+static void diagSetRecorderCommand(RecorderCommand value, const char *reason, const char *source)
+{
+    if (recorderCommand != value)
+    {
+        Serial.printf(
+            "STATE transportCommand=%s reason=%s source=%s ms=%lu\n",
+            diagCommandName(value),
+            reason,
+            source,
+            millis());
+    }
+
+    recorderCommand = value;
+}
+
+static void diagCmdStartRequest(const char *reason, const char *source, bool rawTouchActive, bool validTouch)
+{
+    Serial.printf(
+        "CMD_START reason=%s source=%s ms=%lu transitionBusy=%d isRecording=%d waitForRelease=%d rawTouchActive=%d stopTouchActive=%d validTouch=%d touchCount=%d\n",
+        reason,
+        source,
+        millis(),
+        transitionBusy,
+        isRecording,
+        waitForRelease,
+        rawTouchActive,
+        diagStopTouchActiveState,
+        validTouch,
+        M5.Touch.getCount());
+}
+
+static void diagCmdStopRequest(const char *reason, const char *source, bool stopTouchActive, bool stopValidTouch)
+{
+    Serial.printf(
+        "CMD_STOP reason=%s source=%s ms=%lu transitionBusy=%d isRecording=%d waitForRelease=%d rawTouchActive=%d stopTouchActive=%d stopValidTouch=%d touchCount=%d\n",
+        reason,
+        source,
+        millis(),
+        transitionBusy,
+        isRecording,
+        waitForRelease,
+        diagRawTouchActiveState,
+        stopTouchActive,
+        stopValidTouch,
+        M5.Touch.getCount());
+}
 
 enum UIRequest
 {
@@ -354,7 +476,7 @@ void stopRecording()
 
     Serial.println("DBG stopRecording EXIT");
     Serial.println("RECORD STOP");
-    waitForRelease = true;
+    diagSetWaitForRelease(true, "record stopped", "stopRecording");
 
     isRecording = false;
 }
@@ -371,19 +493,19 @@ void RecorderTask(void *pv)
       case CMD_START:
     Serial.println("ENGINE START REQUEST");
 
-    recorderCommand = CMD_NONE;
+    diagSetRecorderCommand(CMD_NONE, "start command consumed", "RecorderTask");
 
     startRecording();
-    transitionBusy = false;
+    diagSetTransitionBusy(false, "start complete", "RecorderTask");
 
     break;
       case CMD_STOP:
     Serial.println("ENGINE STOP REQUEST");
 
-    recorderCommand = CMD_NONE;
+    diagSetRecorderCommand(CMD_NONE, "stop command consumed", "RecorderTask");
 
     stopRecording();
-    transitionBusy = false;
+    diagSetTransitionBusy(false, "stop complete", "RecorderTask");
 
     break;
       default: break;
@@ -560,7 +682,7 @@ if (uiRequest == UI_SAVED)
 
     if (M5.Touch.getCount() == 0)
     {
-        waitForRelease = false;
+        diagSetWaitForRelease(false, "touch count released while idle", "loop.START");
     }
 
     if (millis() < ignoreTouchUntil)
@@ -601,30 +723,34 @@ for (int i = 0; i < rawCountStart; ++i)
     }
 }
 
-// RC28.2: removed continuous VALID/RAW loop diagnostics
+Serial.printf(
+    "VALID=%d RAW=%d\n",
+    validTouch,
+    rawCountStart);
 
 bool rawNow = validTouch;
 
    if (!rawTouchActive && rawNow)
    {
-        rawTouchActive = true;
+        diagSetRawTouchActive(&rawTouchActive, true, "valid raw touch detected", "loop.START");
         Serial.println("RAW TOUCH START DETECTED");
 
         if (recorderCommand == CMD_NONE &&
             readyForTouch)
         {
             Serial.println("LEGACY TRANSPORT REMOVED");
-            transitionBusy = true;
+            diagSetTransitionBusy(true, "start request accepted", "loop.START");
             readyForTouch = false;
             Serial.printf("START GATE RAW ready=%d cmd=%d trans=%d rec=%d raw=%d\n", readyForTouch, recorderCommand, transitionBusy, isRecording, rawCountStart);
-            waitForRelease = true;
-            recorderCommand = CMD_START;
+            diagSetWaitForRelease(true, "start request waiting for release", "loop.START");
+            diagCmdStartRequest("valid raw touch start gate", "loop.START", rawTouchActive, validTouch);
+            diagSetRecorderCommand(CMD_START, "valid raw touch start gate", "loop.START");
         }
    }
 
    if (rawTouchActive && !rawNow)
    {
-        rawTouchActive = false;
+        diagSetRawTouchActive(&rawTouchActive, false, "valid raw touch released", "loop.START");
         Serial.println("RAW TOUCH RELEASE DETECTED");
    }
 
@@ -730,20 +856,26 @@ bool rawNow = validTouch;
         }
     }
 
-    if (millis() >= stopArmTime && !stopTouchActive && stopValidTouch)
+    if (waitForRelease && !stopValidTouch)
     {
-        stopTouchActive = true;
+        diagSetWaitForRelease(false, "start touch released before stop gate", "loop.STOP");
+    }
+
+    if (!waitForRelease && millis() >= stopArmTime && !stopTouchActive && stopValidTouch)
+    {
+        diagSetStopTouchActive(&stopTouchActive, true, "valid stop touch detected", "loop.STOP");
         Serial.println("STOP TOUCH DETECTED");
 
         if (recorderCommand == CMD_NONE)
         {
-            transitionBusy = true;
-            recorderCommand = CMD_STOP;
+            diagSetTransitionBusy(true, "stop request accepted", "loop.STOP");
+            diagCmdStopRequest("valid stop touch stop gate", "loop.STOP", stopTouchActive, stopValidTouch);
+            diagSetRecorderCommand(CMD_STOP, "valid stop touch stop gate", "loop.STOP");
         }
     }
 
     if (stopTouchActive && !stopValidTouch)
     {
-        stopTouchActive = false;
+        diagSetStopTouchActive(&stopTouchActive, false, "valid stop touch released", "loop.STOP");
     }
 }
