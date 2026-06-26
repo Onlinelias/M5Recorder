@@ -133,3 +133,19 @@ After changing code:
 # Project Principle
 
 Small, explainable, reversible changes always beat large speculative rewrites.
+
+## Working Directory
+
+The canonical working directory is
+
+C:\Users\MVZ\Documents\Arduino\M5Recorder
+
+Always edit files in this directory.
+
+Do not create duplicate project folders.
+
+Do not create timestamped project copies.
+
+Save reports and diffs separately if needed.
+
+The user manually uploads tested versions to GitHub.
