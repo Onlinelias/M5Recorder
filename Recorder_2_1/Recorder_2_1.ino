@@ -37,6 +37,27 @@ static bool transportButtonRawPressed = false;
 static bool transportButtonStablePressed = false;
 static uint32_t transportButtonChangedMs = 0;
 
+static const uint8_t monitorVolume = 20;
+static bool monitorEnabled = false;
+static bool useInputLine2 = false;
+static uint8_t micAdcVolume = 55;
+static bool cleanStereoLineInEnabled = false;
+static uint8_t leftTrimPercent = 40;
+enum ChannelMode
+{
+    CHANNEL_RAW_STEREO,
+    CHANNEL_SWAP_LR,
+    CHANNEL_RIGHT_TO_BOTH,
+    CHANNEL_LEFT_TO_BOTH
+};
+static ChannelMode channelMode = CHANNEL_RAW_STEREO;
+static uint32_t lastLevelDrawMs = 0;
+static uint32_t lastLevelLogMs = 0;
+static uint16_t levelPeakL = 0;
+static uint16_t levelPeakR = 0;
+static bool levelClipped = false;
+static const uint16_t clipThreshold = 32000;
+
 static bool transportTouchArmed = true;
 static uint8_t transportTouchClearSamples = 0;
 static const uint8_t transportTouchClearTarget = 12;
@@ -49,6 +70,18 @@ static uint32_t lastRawTouchDiagnosticHash = 0xFFFFFFFF;
 static void resetTransportTouchLatch(bool allowNewTouch);
 static void handleSerialTransport();
 static void handleButtonTransport();
+static void applyAudioInputSettings();
+static void printAudioInputSettings();
+static bool writeCodecReg(uint8_t reg, uint8_t value);
+static void dumpCodecRegs();
+static void applyCleanStereoLineIn();
+static const char *channelModeName(ChannelMode mode);
+static void printChannelMode();
+static void cycleChannelMode();
+static void applyChannelMode(uint8_t *buffer, size_t size);
+static void printBalance();
+static void analyzeAudioBuffer(const uint8_t *buffer, size_t size);
+static void drawLevelMeter();
 
 M5ModuleAudio device;
 
@@ -132,13 +165,14 @@ static void drawRecordingScreen()
     M5.Display.setCursor(20, 60);
     M5.Display.println(currentFilename);
 
-    int zoneTop = M5.Display.height() - 80;
-    M5.Display.fillRect(0, zoneTop, M5.Display.width(), 80, MAROON);
+    int zoneTop = M5.Display.height() - 44;
+    M5.Display.fillRect(0, zoneTop, M5.Display.width(), 44, MAROON);
     M5.Display.setTextColor(WHITE, MAROON);
-    M5.Display.setCursor(20, zoneTop + 25);
+    M5.Display.setCursor(20, zoneTop + 13);
     M5.Display.println("BUTTON / SERIAL X");
 
     lastDisplayedSec = 0xFFFFFFFF;
+    lastLevelDrawMs = 0;
 }
 
 static void drawRecordingTimer()
@@ -151,8 +185,8 @@ static void drawRecordingTimer()
     }
 
     lastDisplayedSec = sec;
-    M5.Display.fillRect(20, 120, 200, 40, BLACK);
-    M5.Display.setCursor(20, 120);
+    M5.Display.fillRect(20, 98, 200, 34, BLACK);
+    M5.Display.setCursor(20, 100);
     M5.Display.printf("%02lu:%02lu", sec / 60, sec % 60);
 }
 
@@ -391,6 +425,74 @@ static void handleSerialTransport()
         {
             requestStop("INPUT SERIAL_STOP");
         }
+        else if (c == 'm' || c == 'M')
+        {
+            monitorEnabled = !monitorEnabled;
+            Serial.printf("MONITOR %s\n", monitorEnabled ? "ON" : "OFF");
+        }
+        else if (c == 'c' || c == 'C')
+        {
+            cycleChannelMode();
+            printChannelMode();
+        }
+        else if (c == 'i' || c == 'I')
+        {
+            useInputLine2 = !useInputLine2;
+            applyAudioInputSettings();
+            printAudioInputSettings();
+        }
+        else if (c == 'a' || c == 'A')
+        {
+            Serial.println("CLEAN LINE-IN DISABLED");
+        }
+        else if (c == 'r' || c == 'R')
+        {
+            dumpCodecRegs();
+        }
+        else if (c == '[')
+        {
+            if (leftTrimPercent >= 5)
+            {
+                leftTrimPercent -= 5;
+            }
+            printBalance();
+        }
+        else if (c == ']')
+        {
+            if (leftTrimPercent <= 95)
+            {
+                leftTrimPercent += 5;
+            }
+            printBalance();
+        }
+        else if (c == 'b' || c == 'B')
+        {
+            printBalance();
+        }
+        else if (c == '-')
+        {
+            if (micAdcVolume >= 5)
+            {
+                micAdcVolume -= 5;
+            }
+            applyAudioInputSettings();
+            printAudioInputSettings();
+        }
+        else if (c == '+' || c == '=')
+        {
+            if (micAdcVolume <= 95)
+            {
+                micAdcVolume += 5;
+            }
+            applyAudioInputSettings();
+            printAudioInputSettings();
+        }
+        else if (c == '?')
+        {
+            printAudioInputSettings();
+            printChannelMode();
+            printBalance();
+        }
     }
 }
 
@@ -436,6 +538,205 @@ static void handleButtonTransport()
     }
 }
 
+static void applyAudioInputSettings()
+{
+    device.setMicInputLine(useInputLine2 ? ADC_INPUT_LINPUT2_RINPUT2 : ADC_INPUT_LINPUT1_RINPUT1);
+    device.setMicAdcVolume(micAdcVolume);
+}
+
+static void printAudioInputSettings()
+{
+    Serial.printf(
+        "AUDIO INPUT line=%u adc_volume=%u monitor=%s\n",
+        useInputLine2 ? 2 : 1,
+        micAdcVolume,
+        monitorEnabled ? "ON" : "OFF");
+}
+
+static bool writeCodecReg(uint8_t reg, uint8_t value)
+{
+    Wire.beginTransmission(ES8388_ADDR);
+    Wire.write(reg);
+    Wire.write(value);
+    return Wire.endTransmission() == 0;
+}
+
+static void dumpCodecRegs()
+{
+    uint8_t *regs = device.readAllReg();
+    Serial.println("ES8388 REG DUMP");
+    if (regs == nullptr)
+    {
+        Serial.println("  ERR");
+        return;
+    }
+
+    for (uint8_t reg = 0x00; reg <= 0x34; ++reg)
+    {
+        Serial.printf("  %02X=%02X\n", reg, regs[reg]);
+    }
+
+    delete[] regs;
+}
+
+static void applyCleanStereoLineIn()
+{
+    bool ok = true;
+
+    // Keep stereo line input and ADC path intact, but disable the library's
+    // voice/ALC block so line-level stereo is not auto-driven into a rail.
+    ok &= writeCodecReg(ES8388_ADCCONTROL10, 0x00);
+    ok &= writeCodecReg(ES8388_ADCCONTROL11, 0x00);
+
+    Serial.printf("CLEAN LINE-IN APPLY %s\n", ok ? "OK" : "FAIL");
+}
+
+static const char *channelModeName(ChannelMode mode)
+{
+    switch (mode)
+    {
+    case CHANNEL_RAW_STEREO: return "raw_stereo";
+    case CHANNEL_SWAP_LR: return "swap_lr";
+    case CHANNEL_RIGHT_TO_BOTH: return "right_to_both";
+    case CHANNEL_LEFT_TO_BOTH: return "left_to_both";
+    }
+
+    return "unknown";
+}
+
+static void printChannelMode()
+{
+    Serial.printf("CHANNEL MODE %s\n", channelModeName(channelMode));
+}
+
+static void cycleChannelMode()
+{
+    switch (channelMode)
+    {
+    case CHANNEL_RAW_STEREO:
+        channelMode = CHANNEL_SWAP_LR;
+        break;
+    case CHANNEL_SWAP_LR:
+        channelMode = CHANNEL_RIGHT_TO_BOTH;
+        break;
+    case CHANNEL_RIGHT_TO_BOTH:
+        channelMode = CHANNEL_LEFT_TO_BOTH;
+        break;
+    case CHANNEL_LEFT_TO_BOTH:
+        channelMode = CHANNEL_RAW_STEREO;
+        break;
+    }
+}
+
+static void applyChannelMode(uint8_t *buffer, size_t size)
+{
+    int16_t *samples = reinterpret_cast<int16_t *>(buffer);
+    size_t sampleCount = size / sizeof(int16_t);
+
+    for (size_t i = 0; i + 1 < sampleCount; i += 2)
+    {
+        int16_t l = samples[i];
+        int16_t r = samples[i + 1];
+
+        switch (channelMode)
+        {
+        case CHANNEL_SWAP_LR:
+            samples[i] = r;
+            samples[i + 1] = l;
+            break;
+        case CHANNEL_RIGHT_TO_BOTH:
+            samples[i] = r;
+            samples[i + 1] = r;
+            break;
+        case CHANNEL_LEFT_TO_BOTH:
+            samples[i] = l;
+            samples[i + 1] = l;
+            break;
+        case CHANNEL_RAW_STEREO:
+            break;
+        }
+
+        if (leftTrimPercent < 100)
+        {
+            int32_t trimmed = static_cast<int32_t>(samples[i]) * leftTrimPercent / 100;
+            samples[i] = static_cast<int16_t>(trimmed);
+        }
+    }
+}
+
+static void printBalance()
+{
+    Serial.printf("BALANCE left_trim=%u%% right_trim=100%%\n", leftTrimPercent);
+}
+
+static void analyzeAudioBuffer(const uint8_t *buffer, size_t size)
+{
+    const int16_t *samples = reinterpret_cast<const int16_t *>(buffer);
+    size_t sampleCount = size / sizeof(int16_t);
+    uint16_t peakL = 0;
+    uint16_t peakR = 0;
+    bool clipped = false;
+
+    for (size_t i = 0; i + 1 < sampleCount; i += 2)
+    {
+        int32_t l = samples[i];
+        int32_t r = samples[i + 1];
+        uint16_t absL = static_cast<uint16_t>(l < 0 ? (l == -32768 ? 32768 : -l) : l);
+        uint16_t absR = static_cast<uint16_t>(r < 0 ? (r == -32768 ? 32768 : -r) : r);
+
+        if (absL > peakL) peakL = absL;
+        if (absR > peakR) peakR = absR;
+        if (absL >= clipThreshold || absR >= clipThreshold) clipped = true;
+    }
+
+    levelPeakL = peakL;
+    levelPeakR = peakR;
+    levelClipped = clipped;
+
+    uint32_t nowMs = millis();
+    if (clipped && nowMs - lastLevelLogMs >= 250)
+    {
+        Serial.printf("CLIP L=%u R=%u\n", levelPeakL, levelPeakR);
+        lastLevelLogMs = nowMs;
+    }
+}
+
+static void drawMeterBar(int x, int y, const char *label, uint16_t peak)
+{
+    static const int barW = 210;
+    static const int barH = 14;
+    int fillW = static_cast<int>((static_cast<uint32_t>(peak) * barW) / 32768UL);
+    if (fillW > barW) fillW = barW;
+    uint16_t color = peak >= clipThreshold ? RED : (peak > 24000 ? YELLOW : GREEN);
+
+    M5.Display.setTextColor(WHITE, BLACK);
+    M5.Display.setCursor(x, y - 1);
+    M5.Display.print(label);
+    M5.Display.drawRect(x + 22, y, barW, barH, 0x7BEF);
+    M5.Display.fillRect(x + 23, y + 1, barW - 2, barH - 2, BLACK);
+    if (fillW > 2)
+    {
+        M5.Display.fillRect(x + 23, y + 1, fillW - 2, barH - 2, color);
+    }
+}
+
+static void drawLevelMeter()
+{
+    uint32_t nowMs = millis();
+    if (nowMs - lastLevelDrawMs < 120)
+    {
+        return;
+    }
+
+    lastLevelDrawMs = nowMs;
+    M5.Display.fillRect(20, 134, 280, 58, BLACK);
+    drawMeterBar(20, 140, "L", levelPeakL);
+    drawMeterBar(20, 162, "R", levelPeakR);
+    M5.Display.setCursor(252, 151);
+    M5.Display.setTextColor(levelClipped ? RED : (monitorEnabled ? CYAN : 0x7BEF), BLACK);
+    M5.Display.print(levelClipped ? "CLIP" : (monitorEnabled ? "MON" : "   "));
+}
+
 static void recordAudioChunk()
 {
     bool ok =
@@ -448,6 +749,9 @@ static void recordAudioChunk()
         return;
     }
 
+    applyChannelMode(audio_buf, sizeof(audio_buf));
+    analyzeAudioBuffer(audio_buf, sizeof(audio_buf));
+
     size_t written =
         wavFile.write(
             audio_buf,
@@ -457,6 +761,13 @@ static void recordAudioChunk()
     {
         bytesWritten += written;
     }
+
+    if (monitorEnabled && !device.play(audio_buf, sizeof(audio_buf)))
+    {
+        Serial.println("MONITOR PLAY FAIL");
+    }
+
+    drawLevelMeter();
 }
 
 // --------------------------------------------------
@@ -472,6 +783,7 @@ void setup()
     Serial.begin(115200);
     Serial.println("BUILD Recorder_2_1");
     Serial.printf("BUTTON GPIO: %u\n", transportButtonPin);
+    Serial.println("SERIAL: s=start x=stop m=monitor c=channel []=balance b=balance i=input +/-=adc ?=status");
 
     xTaskCreatePinnedToCore(RecorderTask, "RecorderTask", 4096, NULL, 1, &recorderTaskHandle, 0);
 
@@ -498,11 +810,15 @@ void setup()
 
     device.setHPMode(AUDIO_HPMODE_NATIONAL);
     device.setMICStatus(AUDIO_MIC_OPEN);
-    device.setMicInputLine(ADC_INPUT_LINPUT1_RINPUT1);
     device.setMicGain(MIC_GAIN_0DB);
-    device.setMicAdcVolume(70);
+    applyAudioInputSettings();
+    device.setSpeakerOutput(DAC_OUTPUT_OUT1);
+    device.setSpeakerVolume(monitorVolume);
     device.setBitsSample(ES_MODULE_ADC_DAC, BIT_LENGTH_16BITS);
     device.setSampleRate(SAMPLE_RATE_24K);
+    printAudioInputSettings();
+    printChannelMode();
+    printBalance();
 
     drawReadyScreen();
     setAppState(APP_READY);
@@ -764,12 +1080,6 @@ void loop()
         break;
 
     case APP_RECORDING:
-        if (millis() - recordStartTime >= 60000)
-        {
-            requestStop("INPUT AUTO_STOP");
-            break;
-        }
-
         recordAudioChunk();
         drawRecordingTimer();
         break;
